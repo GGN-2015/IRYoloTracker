@@ -16,16 +16,26 @@ from __future__ import annotations
 
 import argparse
 import os
-import pickle
+import random
+import shutil
 import time
 from pathlib import Path
-from typing import Any
 
 import cv2
 import numpy as np
 
-from ir_yolo_tracker import IRMarkerTracker, MarkerDetection, get_default_model_path
-from ir_yolo_tracker.preprocessing import normalize_uint16_to_uint8, validate_ir_frame
+from ir_yolo_tracker import (
+    BrightCircleDetector,
+    IRMarkerTracker,
+    MarkerDetection,
+    draw_detections,
+    get_default_model_path,
+    list_pickle_frames,
+    load_pickle_frame,
+    preload_pickle_frames,
+)
+from ir_yolo_tracker.preprocessing import normalize_uint16_to_uint8
+from ir_yolo_tracker.yolo_format import write_yolo_label_file
 
 WINDOW_NAME = "IRYoloTracker - Infrared Marker Balls"
 DEFAULT_WEIGHTS = Path("runs/detect/ir_marker_ball/weights/best.pt")
@@ -50,8 +60,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iou", type=float, default=0.45, help="YOLO NMS IoU threshold.")
     parser.add_argument(
         "--device",
-        default="cuda",
-        help="Inference device. Defaults to 'cuda'. Use 'cpu' only if you accept slower playback.",
+        default=None,
+        help="Inference device, for example 'cpu', 'cuda', or 0. Defaults to Ultralytics auto selection.",
     )
     parser.add_argument(
         "--model-input-channels",
@@ -63,20 +73,115 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scale", type=float, default=1.5, help="Display scale factor.")
     parser.add_argument("--loop", action="store_true", help="Loop playback until Esc/Q is pressed.")
     parser.add_argument(
+        "--lazy-load",
+        action="store_true",
+        help="Load each pickle frame during playback instead of preloading all frames at startup.",
+    )
+    parser.add_argument(
         "--require-yolo",
         action="store_true",
         help="Exit with an error instead of using the bright-circle preview detector.",
     )
+    parser.add_argument(
+        "--rescue-bright-circles",
+        dest="rescue_bright_circles",
+        action="store_true",
+        default=True,
+        help="Add conservative bright-circle candidates that YOLO missed.",
+    )
+    parser.add_argument(
+        "--no-rescue-bright-circles",
+        dest="rescue_bright_circles",
+        action="store_false",
+        help="Use raw YOLO detections only, without bright-circle rescue candidates.",
+    )
+    parser.add_argument(
+        "--rescue-threshold-percentile",
+        type=float,
+        default=99.9,
+        help="Percentile threshold for the conservative bright-circle rescue detector.",
+    )
+    parser.add_argument(
+        "--rescue-confidence",
+        type=float,
+        default=0.60,
+        help="Minimum bright-circle confidence for rescue candidates.",
+    )
+    parser.add_argument(
+        "--rescue-merge-iou",
+        type=float,
+        default=0.10,
+        help="IoU used to merge duplicate YOLO and rescue boxes.",
+    )
+    parser.add_argument(
+        "--rescue-center-distance",
+        type=float,
+        default=8.0,
+        help="Pixel center distance used to merge duplicate YOLO and rescue boxes.",
+    )
+    parser.add_argument(
+        "--max-detections",
+        type=int,
+        default=0,
+        help="Keep only the top N merged detections. Use 0 to keep all detections.",
+    )
+    pseudo_group = parser.add_argument_group("YOLO pseudo dataset rebuild")
+    pseudo_group.add_argument(
+        "--rebuild-yolo-pseudo-dataset",
+        action="store_true",
+        help=(
+            "Use the current YOLO inference model at a low confidence threshold "
+            "to re-split infrared_data into a pseudo-labeled YOLO train/val dataset."
+        ),
+    )
+    pseudo_group.add_argument(
+        "--pseudo-output",
+        type=Path,
+        default=Path("datasets/yolo_low_conf_ir_marker_ball"),
+        help="Output directory for the low-confidence YOLO pseudo dataset.",
+    )
+    pseudo_group.add_argument(
+        "--pseudo-dataset-yaml",
+        type=Path,
+        default=Path("configs/yolo_low_conf_ir_marker_dataset.yaml"),
+        help="Dataset YAML written for the low-confidence YOLO pseudo dataset.",
+    )
+    pseudo_group.add_argument(
+        "--pseudo-conf",
+        type=float,
+        default=0.05,
+        help="Low YOLO confidence threshold used only when rebuilding pseudo labels.",
+    )
+    pseudo_group.add_argument(
+        "--pseudo-yolo-accept-conf",
+        type=float,
+        default=0.08,
+        help="YOLO pseudo boxes at or above this confidence are kept without circle confirmation.",
+    )
+    pseudo_group.add_argument(
+        "--pseudo-circle-confidence",
+        type=float,
+        default=0.60,
+        help="Minimum bright-circle confidence used when rebuilding pseudo labels.",
+    )
+    pseudo_group.add_argument(
+        "--pseudo-val-ratio",
+        type=float,
+        default=0.2,
+        help="Validation split ratio used when rebuilding pseudo labels.",
+    )
+    pseudo_group.add_argument(
+        "--pseudo-seed",
+        type=int,
+        default=42,
+        help="Random seed for the pseudo dataset train/val split.",
+    )
+    pseudo_group.add_argument(
+        "--keep-pseudo-output",
+        action="store_true",
+        help="Keep existing pseudo dataset files instead of cleaning train/val folders first.",
+    )
     return parser.parse_args()
-
-
-def list_pickle_frames(data_dir: Path) -> list[Path]:
-    if not data_dir.exists():
-        raise FileNotFoundError(f"Data directory does not exist: {data_dir}")
-    frames = sorted(data_dir.glob("*.pickle"))
-    if not frames:
-        raise FileNotFoundError(f"No .pickle frames found in: {data_dir}")
-    return frames
 
 
 def resolve_weights(explicit_weights: Path | None) -> Path | None:
@@ -110,67 +215,6 @@ def resolve_weights(explicit_weights: Path | None) -> Path | None:
     return None
 
 
-class PreviewMarkerDetector:
-    """Lightweight bright-circle detector used only by this runnable example."""
-
-    mode_name = "preview"
-
-    def __init__(
-        self,
-        *,
-        min_area: int = 8,
-        max_area: int = 2_500,
-        min_circularity: float = 0.45,
-        threshold_percentile: float = 99.7,
-    ) -> None:
-        self.min_area = min_area
-        self.max_area = max_area
-        self.min_circularity = min_circularity
-        self.threshold_percentile = threshold_percentile
-
-    def detect(self, frame: np.ndarray) -> list[MarkerDetection]:
-        validate_ir_frame(frame)
-        gray = normalize_uint16_to_uint8(frame)
-        threshold = max(1, int(np.percentile(gray, self.threshold_percentile)))
-        _, binary = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
-
-        kernel = np.ones((3, 3), dtype=np.uint8)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        detections: list[MarkerDetection] = []
-        for contour in contours:
-            area = float(cv2.contourArea(contour))
-            if area < self.min_area or area > self.max_area:
-                continue
-
-            perimeter = float(cv2.arcLength(contour, closed=True))
-            if perimeter <= 0.0:
-                continue
-
-            circularity = 4.0 * np.pi * area / (perimeter * perimeter)
-            if circularity < self.min_circularity:
-                continue
-
-            x, y, width, height = cv2.boundingRect(contour)
-            aspect_ratio = width / max(height, 1)
-            if not 0.55 <= aspect_ratio <= 1.8:
-                continue
-
-            confidence = min(1.0, max(0.0, circularity) * (float(gray[y : y + height, x : x + width].max()) / 255.0))
-            detections.append(
-                MarkerDetection(
-                    bbox_xyxy=(float(x), float(y), float(x + width), float(y + height)),
-                    confidence=confidence,
-                    class_id=0,
-                    class_name="ir_marker_ball",
-                )
-            )
-
-        detections.sort(key=lambda detection: detection.confidence, reverse=True)
-        return detections
-
-
 class YoloDetector:
     """Small adapter that gives the YOLO tracker a display name."""
 
@@ -183,7 +227,47 @@ class YoloDetector:
         return self.tracker.detect(frame)
 
 
-def create_detector(args: argparse.Namespace) -> tuple[YoloDetector | PreviewMarkerDetector, Path | None]:
+class YoloWithCircleRescueDetector:
+    """YOLO detector with a conservative bright-circle rescue pass."""
+
+    mode_name = "YOLO+circle"
+
+    def __init__(
+        self,
+        tracker: IRMarkerTracker,
+        *,
+        rescue_detector: BrightCircleDetector,
+        rescue_confidence: float,
+        merge_iou: float,
+        center_distance: float,
+        max_detections: int | None,
+    ) -> None:
+        self.tracker = tracker
+        self.rescue_detector = rescue_detector
+        self.rescue_confidence = rescue_confidence
+        self.merge_iou = merge_iou
+        self.center_distance = center_distance
+        self.max_detections = max_detections
+
+    def detect(self, frame: np.ndarray) -> list[MarkerDetection]:
+        yolo_detections = self.tracker.detect(frame)
+        rescue_detections = [
+            detection
+            for detection in self.rescue_detector.detect(frame)
+            if detection.confidence >= self.rescue_confidence
+        ]
+        return merge_marker_detections(
+            yolo_detections,
+            rescue_detections,
+            iou_threshold=self.merge_iou,
+            center_distance=self.center_distance,
+            max_detections=self.max_detections,
+        )
+
+
+def create_detector(
+    args: argparse.Namespace,
+) -> tuple[YoloDetector | YoloWithCircleRescueDetector | BrightCircleDetector, Path | None]:
     weights = resolve_weights(args.weights)
     if weights is None:
         if args.require_yolo:
@@ -192,7 +276,7 @@ def create_detector(args: argparse.Namespace) -> tuple[YoloDetector | PreviewMar
                 "or run this example with --weights path\\to\\best.pt."
             )
         print("No YOLO weights found. Using the bright-circle preview detector.")
-        return PreviewMarkerDetector(), None
+        return BrightCircleDetector(), None
 
     tracker = IRMarkerTracker(
         weights,
@@ -201,105 +285,334 @@ def create_detector(args: argparse.Namespace) -> tuple[YoloDetector | PreviewMar
         model_input_channels=args.model_input_channels,
         device=args.device,
     )
-    return YoloDetector(tracker), weights
+    return wrap_yolo_tracker_for_display(tracker, args), weights
 
 
-def load_pickle_frame(path: Path) -> np.ndarray:
-    with path.open("rb") as file:
-        payload = pickle.load(file)
+def wrap_yolo_tracker_for_display(
+    tracker: IRMarkerTracker,
+    args: argparse.Namespace,
+) -> YoloDetector | YoloWithCircleRescueDetector:
+    if not args.rescue_bright_circles:
+        return YoloDetector(tracker)
 
-    frame = extract_frame_array(payload)
-    validate_ir_frame(frame)
-    return frame
-
-
-def extract_frame_array(payload: Any) -> np.ndarray:
-    if isinstance(payload, np.ndarray):
-        return payload
-
-    if isinstance(payload, dict):
-        preferred_keys = ("frame", "image", "infrared", "ir", "data", "array")
-        for key in preferred_keys:
-            value = payload.get(key)
-            if isinstance(value, np.ndarray):
-                return value
-        for value in payload.values():
-            if isinstance(value, np.ndarray):
-                return value
-
-    if isinstance(payload, (list, tuple)):
-        for value in payload:
-            if isinstance(value, np.ndarray):
-                return value
-
-    raise TypeError(f"Cannot find a numpy.ndarray infrared frame in pickle payload {type(payload)!r}.")
-
-
-def draw_detections(
-    gray_u8: np.ndarray,
-    detections: list[MarkerDetection],
-    frame_name: str,
-    frame_index: int,
-    total_frames: int,
-    actual_fps: float,
-    detector_name: str,
-) -> np.ndarray:
-    canvas = cv2.cvtColor(gray_u8, cv2.COLOR_GRAY2BGR)
-
-    for detection in detections:
-        x_min, y_min, x_max, y_max = [int(round(value)) for value in detection.bbox_xyxy]
-        cv2.rectangle(canvas, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
-
-        label = f"{detection.confidence:.2f}"
-        text_origin = (x_min, max(16, y_min - 6))
-        draw_label(canvas, label, text_origin)
-
-    status = (
-        f"{detector_name}  {frame_index + 1}/{total_frames}  {frame_name}  "
-        f"detections: {len(detections)}  fps: {actual_fps:4.1f}"
+    return YoloWithCircleRescueDetector(
+        tracker,
+        rescue_detector=BrightCircleDetector(
+            threshold_percentile=args.rescue_threshold_percentile,
+        ),
+        rescue_confidence=args.rescue_confidence,
+        merge_iou=args.rescue_merge_iou,
+        center_distance=args.rescue_center_distance,
+        max_detections=normalize_max_detections(args.max_detections),
     )
-    draw_label(canvas, status, (8, 20), background=(0, 0, 0), foreground=(255, 255, 255))
-    return canvas
 
 
-def draw_label(
-    image: np.ndarray,
-    text: str,
-    origin: tuple[int, int],
-    background: tuple[int, int, int] = (0, 80, 0),
-    foreground: tuple[int, int, int] = (255, 255, 255),
-) -> None:
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.45
-    thickness = 1
-    x, y = origin
-    (width, height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
-    x = max(0, min(x, image.shape[1] - width - 4))
-    y = max(height + 4, min(y, image.shape[0] - baseline - 2))
+def normalize_max_detections(value: int) -> int | None:
+    if value < 0:
+        raise ValueError("--max-detections must be 0 or a positive integer.")
+    return value or None
 
-    cv2.rectangle(
-        image,
-        (x - 2, y - height - 4),
-        (x + width + 2, y + baseline + 2),
-        background,
-        thickness=-1,
+
+def create_pseudo_label_detector(
+    args: argparse.Namespace,
+) -> tuple[YoloDetector, BrightCircleDetector, Path]:
+    weights = resolve_weights(args.weights)
+    if weights is None:
+        raise FileNotFoundError(
+            "No YOLO weights found. The pseudo dataset rebuild must use an existing "
+            "YOLO model, so pass --weights path\\to\\best.pt or keep the bundled model installed."
+        )
+
+    if not 0.0 <= args.pseudo_conf <= 1.0:
+        raise ValueError("--pseudo-conf must be between 0 and 1.")
+    if not 0.0 <= args.pseudo_yolo_accept_conf <= 1.0:
+        raise ValueError("--pseudo-yolo-accept-conf must be between 0 and 1.")
+    if args.pseudo_yolo_accept_conf < args.pseudo_conf:
+        raise ValueError("--pseudo-yolo-accept-conf must be greater than or equal to --pseudo-conf.")
+    if not 0.0 <= args.pseudo_circle_confidence <= 1.0:
+        raise ValueError("--pseudo-circle-confidence must be between 0 and 1.")
+
+    tracker = IRMarkerTracker(
+        weights,
+        confidence_threshold=args.pseudo_conf,
+        iou_threshold=args.iou,
+        model_input_channels=args.model_input_channels,
+        device=args.device,
     )
-    cv2.putText(image, text, (x, y), font, font_scale, foreground, thickness, cv2.LINE_AA)
+    circle_detector = BrightCircleDetector(
+        threshold_percentile=args.rescue_threshold_percentile,
+    )
+    return YoloDetector(tracker), circle_detector, weights
 
 
-def resize_for_display(image: np.ndarray, scale: float) -> np.ndarray:
-    if scale <= 0:
-        raise ValueError("scale must be positive.")
-    if scale == 1.0:
-        return image
-    width = max(1, int(round(image.shape[1] * scale)))
-    height = max(1, int(round(image.shape[0] * scale)))
-    return cv2.resize(image, (width, height), interpolation=cv2.INTER_NEAREST)
+def merge_marker_detections(
+    primary: list[MarkerDetection],
+    rescue: list[MarkerDetection],
+    *,
+    iou_threshold: float,
+    center_distance: float,
+    max_detections: int | None = None,
+) -> list[MarkerDetection]:
+    if not 0.0 <= iou_threshold <= 1.0:
+        raise ValueError("iou_threshold must be between 0 and 1.")
+    if center_distance < 0:
+        raise ValueError("center_distance must be non-negative.")
+
+    merged = list(primary)
+    for candidate in rescue:
+        if any(
+            detections_match(
+                candidate,
+                existing,
+                iou_threshold=iou_threshold,
+                center_distance=center_distance,
+            )
+            for existing in merged
+        ):
+            continue
+        merged.append(candidate)
+
+    merged.sort(key=lambda detection: detection.confidence, reverse=True)
+    if max_detections is not None:
+        merged = merged[:max_detections]
+    return merged
+
+
+def fuse_pseudo_label_detections(
+    yolo_detections: list[MarkerDetection],
+    circle_detections: list[MarkerDetection],
+    *,
+    yolo_accept_confidence: float,
+    circle_confidence: float,
+    iou_threshold: float,
+    center_distance: float,
+) -> list[MarkerDetection]:
+    """Fuse YOLO and bright-circle evidence for pseudo labels.
+
+    High-confidence YOLO boxes are kept directly. Low-confidence YOLO boxes are
+    kept only when a bright circular blob confirms the same marker location.
+    High-confidence circle detections can still rescue a missed marker.
+    """
+
+    confirmed_circles = [
+        detection
+        for detection in circle_detections
+        if detection.confidence >= circle_confidence
+    ]
+    accepted: list[MarkerDetection] = []
+
+    for detection in yolo_detections:
+        if detection.confidence >= yolo_accept_confidence or any(
+            detections_match(
+                detection,
+                circle,
+                iou_threshold=iou_threshold,
+                center_distance=center_distance,
+            )
+            for circle in confirmed_circles
+        ):
+            accepted.append(detection)
+
+    return merge_marker_detections(
+        accepted,
+        confirmed_circles,
+        iou_threshold=iou_threshold,
+        center_distance=center_distance,
+    )
+
+
+def detections_match(
+    first: MarkerDetection,
+    second: MarkerDetection,
+    *,
+    iou_threshold: float,
+    center_distance: float,
+) -> bool:
+    if bbox_iou(first.bbox_xyxy, second.bbox_xyxy) >= iou_threshold:
+        return True
+
+    first_x, first_y = first.center_xy
+    second_x, second_y = second.center_xy
+    distance = ((first_x - second_x) ** 2 + (first_y - second_y) ** 2) ** 0.5
+    return distance <= center_distance
+
+
+def bbox_iou(
+    first: tuple[float, float, float, float],
+    second: tuple[float, float, float, float],
+) -> float:
+    first_x1, first_y1, first_x2, first_y2 = first
+    second_x1, second_y1, second_x2, second_y2 = second
+
+    inter_x1 = max(first_x1, second_x1)
+    inter_y1 = max(first_y1, second_y1)
+    inter_x2 = min(first_x2, second_x2)
+    inter_y2 = min(first_y2, second_y2)
+    inter_width = max(0.0, inter_x2 - inter_x1)
+    inter_height = max(0.0, inter_y2 - inter_y1)
+    intersection = inter_width * inter_height
+
+    first_area = max(0.0, first_x2 - first_x1) * max(0.0, first_y2 - first_y1)
+    second_area = max(0.0, second_x2 - second_x1) * max(0.0, second_y2 - second_y1)
+    union = first_area + second_area - intersection
+    if union <= 0.0:
+        return 0.0
+    return intersection / union
+
+
+def split_frame_paths(
+    frame_paths: list[Path],
+    val_ratio: float,
+    seed: int,
+) -> tuple[list[Path], list[Path]]:
+    if not 0.0 <= val_ratio < 1.0:
+        raise ValueError("--pseudo-val-ratio must satisfy 0 <= ratio < 1.")
+
+    shuffled = list(frame_paths)
+    random.Random(seed).shuffle(shuffled)
+    val_count = int(round(len(shuffled) * val_ratio))
+    val_frames = sorted(shuffled[:val_count])
+    train_frames = sorted(shuffled[val_count:])
+    return train_frames, val_frames
+
+
+def rebuild_yolo_pseudo_dataset(args: argparse.Namespace) -> None:
+    frame_paths = list_pickle_frames(args.data_dir)
+    train_frames, val_frames = split_frame_paths(
+        frame_paths,
+        val_ratio=args.pseudo_val_ratio,
+        seed=args.pseudo_seed,
+    )
+    detector, circle_detector, weights = create_pseudo_label_detector(args)
+
+    prepare_pseudo_output_dirs(args.pseudo_output, clean=not args.keep_pseudo_output)
+
+    print(f"Using YOLO weights: {weights}")
+    print(f"Pseudo confidence threshold: {args.pseudo_conf:.3f}")
+    print(
+        f"Split: {len(train_frames)} train frames, {len(val_frames)} val frames "
+        f"from {args.data_dir}"
+    )
+
+    if frame_paths:
+        warmup_frame = load_pickle_frame(frame_paths[0])
+        detector.detect(warmup_frame)
+        circle_detector.detect(warmup_frame)
+
+    train_labeled, train_boxes = write_pseudo_dataset_split(
+        train_frames,
+        split="train",
+        output_root=args.pseudo_output,
+        detector=detector,
+        circle_detector=circle_detector,
+        args=args,
+    )
+    val_labeled, val_boxes = write_pseudo_dataset_split(
+        val_frames,
+        split="val",
+        output_root=args.pseudo_output,
+        detector=detector,
+        circle_detector=circle_detector,
+        args=args,
+    )
+    write_pseudo_dataset_yaml(args.pseudo_dataset_yaml, args.pseudo_output)
+
+    print(f"Dataset: {args.pseudo_output}")
+    print(f"YAML: {args.pseudo_dataset_yaml}")
+    print(f"Train: {len(train_frames)} frames, {train_labeled} labeled, {train_boxes} boxes")
+    print(f"Val: {len(val_frames)} frames, {val_labeled} labeled, {val_boxes} boxes")
+
+
+def prepare_pseudo_output_dirs(output_root: Path, *, clean: bool) -> None:
+    for split in ("train", "val"):
+        for folder in ("images", "labels"):
+            directory = output_root / folder / split
+            if clean and directory.exists():
+                remove_generated_directory(directory, output_root)
+            directory.mkdir(parents=True, exist_ok=True)
+
+
+def remove_generated_directory(directory: Path, output_root: Path) -> None:
+    resolved_directory = directory.resolve()
+    resolved_root = output_root.resolve()
+    if resolved_directory == resolved_root or resolved_root not in resolved_directory.parents:
+        raise ValueError(f"Refusing to remove directory outside pseudo output root: {directory}")
+    shutil.rmtree(resolved_directory)
+
+
+def write_pseudo_dataset_split(
+    frame_paths: list[Path],
+    *,
+    split: str,
+    output_root: Path,
+    detector: YoloDetector,
+    circle_detector: BrightCircleDetector,
+    args: argparse.Namespace,
+) -> tuple[int, int]:
+    images_dir = output_root / "images" / split
+    labels_dir = output_root / "labels" / split
+
+    frames_with_labels = 0
+    total_boxes = 0
+    for frame_path in progress_frames(frame_paths, description=f"YOLO pseudo-label {split}"):
+        frame = load_pickle_frame(frame_path)
+        detections = fuse_pseudo_label_detections(
+            detector.detect(frame),
+            circle_detector.detect(frame),
+            yolo_accept_confidence=args.pseudo_yolo_accept_conf,
+            circle_confidence=args.pseudo_circle_confidence,
+            iou_threshold=args.rescue_merge_iou,
+            center_distance=args.rescue_center_distance,
+        )
+
+        if detections:
+            frames_with_labels += 1
+        total_boxes += len(detections)
+
+        gray = normalize_uint16_to_uint8(frame)
+        image_path = images_dir / f"{frame_path.stem}.png"
+        label_path = labels_dir / f"{frame_path.stem}.txt"
+
+        if not cv2.imwrite(str(image_path), gray):
+            raise OSError(f"failed to write image: {image_path}")
+
+        write_yolo_label_file(
+            label_path,
+            [detection.bbox_xyxy for detection in detections],
+            image_width=frame.shape[1],
+            image_height=frame.shape[0],
+            class_id=0,
+        )
+
+    return frames_with_labels, total_boxes
+
+
+def progress_frames(frame_paths: list[Path], *, description: str):
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        return frame_paths
+    return tqdm(frame_paths, desc=description, unit="frame")
+
+
+def write_pseudo_dataset_yaml(dataset_yaml: Path, output_root: Path) -> None:
+    dataset_yaml.parent.mkdir(parents=True, exist_ok=True)
+    content = (
+        "# Low-confidence YOLO pseudo dataset generated by example_infrared_video.py.\n"
+        "# Labels come from the current inference model, not human annotation.\n\n"
+        f"path: {output_root.as_posix()}\n"
+        "train: images/train\n"
+        "val: images/val\n"
+        "test:\n\n"
+        "names:\n"
+        "  0: ir_marker_ball\n"
+    )
+    dataset_yaml.write_text(content, encoding="utf-8")
 
 
 def play_frames(
-    frame_paths: list[Path],
-    detector: YoloDetector | PreviewMarkerDetector,
+    frames: list[tuple[Path, np.ndarray | None]],
+    detector: YoloDetector | YoloWithCircleRescueDetector | BrightCircleDetector,
     fps: float,
     display_scale: float,
     loop: bool,
@@ -313,27 +626,28 @@ def play_frames(
     last_frame_time = time.perf_counter()
     try:
         while True:
-            for index, frame_path in enumerate(frame_paths):
+            for index, (frame_path, frame) in enumerate(frames):
                 frame_start = time.perf_counter()
 
-                frame = load_pickle_frame(frame_path)
+                if frame is None:
+                    frame = load_pickle_frame(frame_path)
+
                 detections = detector.detect(frame)
-                gray_u8 = normalize_uint16_to_uint8(frame)
 
                 now = time.perf_counter()
                 actual_fps = 1.0 / max(now - last_frame_time, 1e-9)
                 last_frame_time = now
 
-                display = draw_detections(
-                    gray_u8,
-                    detections,
-                    frame_name=frame_path.name,
-                    frame_index=index,
-                    total_frames=len(frame_paths),
-                    actual_fps=actual_fps,
-                    detector_name=detector.mode_name,
+                status = (
+                    f"{detector.mode_name}  {index + 1}/{len(frames)}  {frame_path.name}  "
+                    f"detections: {len(detections)}  fps: {actual_fps:4.1f}"
                 )
-                display = resize_for_display(display, display_scale)
+                display = draw_detections(
+                    frame,
+                    detections,
+                    status=status,
+                    scale=display_scale,
+                )
                 cv2.imshow(WINDOW_NAME, display)
 
                 elapsed = time.perf_counter() - frame_start
@@ -361,16 +675,39 @@ def wait_until_resume() -> bool:
 
 def main() -> None:
     args = parse_args()
+    if args.rebuild_yolo_pseudo_dataset:
+        rebuild_yolo_pseudo_dataset(args)
+        return
+
     detector, weights = create_detector(args)
-    frame_paths = list_pickle_frames(args.data_dir)
 
     if weights is not None:
         print(f"Using YOLO weights: {weights}")
-    print(f"Loaded {len(frame_paths)} pickle frames from {args.data_dir}")
+
+    if args.lazy_load:
+        frame_paths = list_pickle_frames(args.data_dir)
+        frames: list[tuple[Path, np.ndarray | None]] = [(path, None) for path in frame_paths]
+        print(f"Lazy-load mode: {len(frame_paths)} pickle frames will be read during playback.")
+    else:
+        preload_start = time.perf_counter()
+        frames = preload_pickle_frames(args.data_dir, progress=True)
+        elapsed = time.perf_counter() - preload_start
+        total_bytes = sum(frame.nbytes for _, frame in frames)
+        print(
+            f"Preloaded {len(frames)} pickle frames from {args.data_dir} "
+            f"in {elapsed:.2f}s ({total_bytes / (1024 * 1024):.1f} MiB)."
+        )
+
+    if frames:
+        warmup_start = time.perf_counter()
+        first_frame = frames[0][1] if frames[0][1] is not None else load_pickle_frame(frames[0][0])
+        detector.detect(first_frame)
+        print(f"Detector warm-up finished in {time.perf_counter() - warmup_start:.2f}s.")
+
     print("Press Space to pause/resume, Q or Esc to quit.")
 
     play_frames(
-        frame_paths=frame_paths,
+        frames=frames,
         detector=detector,
         fps=args.fps,
         display_scale=args.scale,

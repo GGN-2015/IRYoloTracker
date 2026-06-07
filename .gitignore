@@ -9,6 +9,7 @@ yolo*.pt
 
 # C extensions
 *.so
+/image*.png
 
 # Distribution / packaging
 .Python

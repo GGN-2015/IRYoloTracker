@@ -4,17 +4,27 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from ir_yolo_tracker import IRMarkerTracker
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("frame", type=Path, help="Path to a 512x512 uint16 .npy file.")
-    parser.add_argument("--weights", required=True, type=Path, help="Trained YOLO .pt weights.")
+    parser.add_argument("frame", type=Path, help="Path to a 2D uint16 .npy file.")
+    parser.add_argument(
+        "--weights",
+        default=None,
+        type=Path,
+        help="Trained YOLO .pt weights. Defaults to the bundled bootstrap model.",
+    )
     parser.add_argument("--conf", type=float, default=0.25, help="Confidence threshold.")
     parser.add_argument("--iou", type=float, default=0.45, help="NMS IoU threshold.")
     parser.add_argument(

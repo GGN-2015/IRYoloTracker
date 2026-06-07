@@ -13,7 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from example_infrared_video import PreviewMarkerDetector, load_pickle_frame
+from ir_yolo_tracker import BrightCircleDetector, load_pickle_frame
 from ir_yolo_tracker.preprocessing import normalize_uint16_to_uint8
 from ir_yolo_tracker.yolo_format import write_yolo_label_file
 
@@ -50,7 +50,7 @@ def write_dataset_split(
     frame_paths: list[Path],
     split: str,
     output_root: Path,
-    detector: PreviewMarkerDetector,
+    detector: BrightCircleDetector,
     confidence: float,
 ) -> tuple[int, int]:
     images_dir = output_root / "images" / split
@@ -110,7 +110,7 @@ def main() -> None:
     args = parse_args()
     frames = list_frames(args.data_dir)
     train_frames, val_frames = split_frames(frames, args.val_ratio, args.seed)
-    detector = PreviewMarkerDetector()
+    detector = BrightCircleDetector()
 
     train_labeled, train_boxes = write_dataset_split(
         train_frames,

@@ -117,8 +117,8 @@ def write_split(
         write_yolo_label_file(
             label_path,
             record_boxes(record),
-            image_width=config.frame_shape[1],
-            image_height=config.frame_shape[0],
+            image_width=frame.shape[1],
+            image_height=frame.shape[0],
             class_id=0,
         )
 

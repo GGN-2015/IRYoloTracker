@@ -20,15 +20,16 @@ class PreprocessConfig:
     satisfy standard YOLO model input shapes.
     """
 
-    frame_shape: FrameShape = (512, 512)
+    frame_shape: FrameShape | None = None
     lower_percentile: float = 0.1
     upper_percentile: float = 99.9
 
     def __post_init__(self) -> None:
-        if len(self.frame_shape) != 2:
-            raise ValueError("frame_shape must contain exactly two dimensions.")
-        if self.frame_shape[0] <= 0 or self.frame_shape[1] <= 0:
-            raise ValueError("frame_shape dimensions must be positive.")
+        if self.frame_shape is not None:
+            if len(self.frame_shape) != 2:
+                raise ValueError("frame_shape must contain exactly two dimensions.")
+            if self.frame_shape[0] <= 0 or self.frame_shape[1] <= 0:
+                raise ValueError("frame_shape dimensions must be positive.")
         if not 0.0 <= self.lower_percentile < self.upper_percentile <= 100.0:
             raise ValueError(
                 "Percentiles must satisfy "
@@ -36,14 +37,18 @@ class PreprocessConfig:
             )
 
 
-def validate_ir_frame(frame: np.ndarray, frame_shape: FrameShape = (512, 512)) -> None:
+def validate_ir_frame(frame: np.ndarray, frame_shape: FrameShape | None = None) -> None:
     """Validate that ``frame`` is a single-channel uint16 infrared image."""
 
     if not isinstance(frame, np.ndarray):
         raise TypeError("frame must be a numpy.ndarray.")
     if frame.dtype != np.uint16:
         raise TypeError("frame must have dtype numpy.uint16.")
-    if frame.shape != frame_shape:
+    if frame.ndim != 2:
+        raise ValueError(f"frame must be a two-dimensional grayscale image, got shape {frame.shape}.")
+    if frame.shape[0] <= 0 or frame.shape[1] <= 0:
+        raise ValueError(f"frame dimensions must be positive, got shape {frame.shape}.")
+    if frame_shape is not None and frame.shape != frame_shape:
         raise ValueError(f"frame must have shape {frame_shape}, got {frame.shape}.")
 
 
@@ -66,7 +71,7 @@ def normalize_uint16_to_uint8(
         upper = float(frame.max())
 
     if upper <= lower:
-        return np.zeros(config.frame_shape, dtype=np.uint8)
+        return np.zeros(frame.shape, dtype=np.uint8)
 
     normalized = (frame.astype(np.float32) - float(lower)) * (255.0 / float(upper - lower))
     return np.clip(normalized, 0.0, 255.0).astype(np.uint8)
@@ -80,7 +85,7 @@ def prepare_yolo_image(
     """Prepare a single infrared frame for YOLO inference.
 
     Args:
-        frame: A single-channel ``512x512`` ``numpy.uint16`` infrared frame.
+        frame: A single-channel two-dimensional ``numpy.uint16`` infrared frame.
         config: Optional preprocessing settings.
         model_input_channels: Use ``3`` for standard YOLO weights, or ``1`` for
             a YOLO model trained with a one-channel input layer.

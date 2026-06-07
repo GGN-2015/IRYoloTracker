@@ -23,7 +23,7 @@ For GPU inference on Windows, install the CUDA PyTorch wheels in the same venv:
 .\venv\Scripts\python.exe -m pip install --force-reinstall torch==2.12.0+cu130 torchvision==0.27.0+cu130 --index-url https://download.pytorch.org/whl/cu130
 ```
 
-## Inference
+## Python API
 
 The package includes a bootstrap YOLO model trained from high-confidence
 bright-circle pseudo-labels in `infrared_data`. You can use it directly:
@@ -35,21 +35,76 @@ from ir_yolo_tracker import IRMarkerTracker
 
 frame: np.ndarray = np.load("frame.npy")
 
-tracker = IRMarkerTracker(confidence_threshold=0.35)
+tracker = IRMarkerTracker(confidence_threshold=0.35, device="cpu")
 
 detections = tracker.detect_dicts(frame)
 print(detections)
 ```
 
-Inference defaults to `device="cuda"` so the detector uses GPU acceleration.
-This project venv must have a CUDA-enabled PyTorch build installed. If you
-explicitly want slow CPU inference for debugging, pass `device="cpu"`.
+For one-off detection, use the convenience function:
+
+```python
+import numpy as np
+
+from ir_yolo_tracker import detect_marker_dicts
+
+frame: np.ndarray = np.load("frame.npy")
+detections = detect_marker_dicts(frame, confidence_threshold=0.35, device="cpu")
+```
+
+For repeated frames, create one tracker and reuse it:
+
+```python
+from ir_yolo_tracker import IRMarkerTracker, preload_pickle_frames
+
+tracker = IRMarkerTracker(device="cpu")
+frames = preload_pickle_frames("infrared_data", progress=True)
+
+for path, frame in frames:
+    detections = tracker.detect(frame)
+    print(path.name, detections)
+```
+
+Batch-style helpers are also available:
+
+```python
+from ir_yolo_tracker import detect_marker_batch, iter_pickle_detections
+
+all_results = detect_marker_batch(frames, device="cpu")
+
+for path, detections in iter_pickle_detections("infrared_data", device="cpu"):
+    ...
+```
+
+To draw results on a frame:
+
+```python
+import cv2
+
+from ir_yolo_tracker import draw_detections
+
+image = draw_detections(frame, detections, status="IR marker detections")
+cv2.imshow("detections", image)
+cv2.waitKey(0)
+```
+
+Pass `device="cuda"` or `device=0` to request GPU inference. If `device` is not
+set, Ultralytics chooses the device.
+
+The public API includes:
+
+- `IRMarkerTracker`: reusable YOLO detector class.
+- `detect_markers`, `detect_marker_dicts`: one-frame convenience functions.
+- `detect_marker_batch`, `iter_marker_detections`: multi-frame helpers.
+- `load_pickle_frame`, `iter_pickle_frames`, `iter_pickle_detections`: pickle sequence helpers.
+- `draw_detections`: OpenCV visualization helper.
+- `BrightCircleDetector`: non-YOLO bright-circle detector for pseudo-labeling/debugging.
 
 For production accuracy, train with human-verified labels and pass your own
 `best.pt`:
 
 ```python
-tracker = IRMarkerTracker("runs/detect/ir_marker_ball/weights/best.pt")
+tracker = IRMarkerTracker("runs/detect/ir_marker_ball/weights/best.pt", device="cpu")
 ```
 
 Each detection contains only the marker-ball class:
@@ -75,24 +130,59 @@ The input frame must be exactly:
 ## Command-Line Inference
 
 ```powershell
-.\venv\Scripts\python.exe scripts\detect_npy.py frame.npy --weights runs\detect\ir_marker_ball\weights\best.pt
+.\venv\Scripts\python.exe scripts\detect_npy.py frame.npy
 ```
 
 ## Infrared Video Example
 
 The root-level example `example_infrared_video.py` plays `.pickle` frames from
-`infrared_data` at 24 FPS and overlays marker-ball boxes and confidences.
+`infrared_data` at 24 FPS and overlays marker-ball boxes and confidences. This
+file is a repository example, not an installed package entry point. To use it,
+clone the GitHub project and run it from the project root.
+
+```powershell
+git clone https://github.com/GGN-2015/IRYoloTracker.git
+cd IRYoloTracker
+.\venv\Scripts\python.exe -m pip install -e ".[dev]"
+```
+
+Run with the bundled bootstrap YOLO model:
+
+```powershell
+.\venv\Scripts\python.exe example_infrared_video.py
+```
+
+Run with custom trained weights:
 
 ```powershell
 .\venv\Scripts\python.exe example_infrared_video.py --weights runs\detect\ir_marker_ball\weights\best.pt
 ```
 
-If the default `runs/detect/ir_marker_ball/weights/best.pt` file exists, this
-also works:
+Common options:
 
 ```powershell
-.\venv\Scripts\python.exe example_infrared_video.py
+.\venv\Scripts\python.exe example_infrared_video.py --device cuda
+.\venv\Scripts\python.exe example_infrared_video.py --device cpu
+.\venv\Scripts\python.exe example_infrared_video.py --fps 24 --scale 1.5
+.\venv\Scripts\python.exe example_infrared_video.py --lazy-load
+.\venv\Scripts\python.exe example_infrared_video.py --loop
+.\venv\Scripts\python.exe example_infrared_video.py --no-rescue-bright-circles
 ```
+
+At startup the example preloads all pickle frames into memory and shows a
+`tqdm` progress bar. This removes disk IO and pickle decoding from the playback
+loop. Use `--lazy-load` to read frames during playback instead.
+
+The example defaults to `--conf 0.25` and enables a conservative
+`YOLO+circle` rescue pass. YOLO still supplies the main predictions, but the
+example also adds high-confidence bright circular blobs that do not overlap an
+existing YOLO box. This helps recover marker balls that the bootstrap YOLO model
+sees only at very low confidence. Use `--no-rescue-bright-circles` to view raw
+YOLO output.
+
+There is no default marker-count cap. Use `--max-detections N` only when your
+camera setup has a known physical upper bound and you explicitly want to keep
+the top-scoring detections.
 
 If no YOLO weights are found, the example falls back to a simple bright-circle
 preview detector so you can still inspect the infrared frame sequence. In a
@@ -100,12 +190,7 @@ normal package checkout this should not happen because a bootstrap model is
 bundled. Pass `--require-yolo` if you want it to fail unless YOLO weights are
 present.
 
-The video example also defaults to `--device cuda`. CPU inference is available
-only when requested explicitly:
-
-```powershell
-.\venv\Scripts\python.exe example_infrared_video.py --device cpu
-```
+Press Space to pause/resume, or press `Q`/Esc to quit.
 
 ## Bootstrap Model
 
@@ -120,7 +205,19 @@ bright-circle detector with confidence `>= 0.70`:
 This is useful as a project bootstrap. Replace it with a model trained on
 human-reviewed marker-ball labels before relying on it for critical measurement.
 
-Press Space to pause/resume, or press `Q`/Esc to quit.
+The video example can also rebuild a lower-threshold YOLO pseudo dataset from
+`infrared_data`. It uses the current inference model plus the same conservative
+bright-circle rescue pass. Low-confidence YOLO boxes below
+`--pseudo-yolo-accept-conf` are kept only when bright-circle evidence confirms
+the same location:
+
+```powershell
+.\venv\Scripts\python.exe example_infrared_video.py --rebuild-yolo-pseudo-dataset --device cuda --pseudo-conf 0.05
+```
+
+By default this writes images and labels to
+`datasets/yolo_low_conf_ir_marker_ball` and writes
+`configs/yolo_low_conf_ir_marker_dataset.yaml`.
 
 ## Training Data
 

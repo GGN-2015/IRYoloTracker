@@ -31,7 +31,7 @@ class IRMarkerTracker:
         marker_class_name: str = "ir_marker_ball",
         model_input_channels: ModelInputChannels = 3,
         preprocess_config: PreprocessConfig | None = None,
-        device: str | int | None = "cuda",
+        device: str | int | None = None,
     ) -> None:
         if model is None and weights is None:
             weights = get_default_model_path()

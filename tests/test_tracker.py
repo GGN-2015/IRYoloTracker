@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-import torch
 
 from ir_yolo_tracker import IRMarkerTracker, get_default_model_path
 
@@ -38,13 +37,10 @@ def test_default_model_asset_exists() -> None:
     assert get_default_model_path().exists()
 
 
-def test_default_tracker_requires_cuda_inference_by_default() -> None:
-    if torch.cuda.is_available():
-        tracker = IRMarkerTracker()
-        assert tracker.device == "cuda"
-    else:
-        with pytest.raises(RuntimeError, match="CUDA is not available"):
-            IRMarkerTracker()
+def test_default_tracker_uses_auto_device_selection() -> None:
+    tracker = IRMarkerTracker()
+
+    assert tracker.device is None
 
 
 def test_bundled_tracker_can_be_loaded_on_cpu_when_explicit() -> None:
