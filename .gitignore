@@ -2,6 +2,10 @@
 __pycache__/
 *.py[codz]
 *$py.class
+infrared_data/
+datasets/
+runs/
+yolo*.pt
 
 # C extensions
 *.so

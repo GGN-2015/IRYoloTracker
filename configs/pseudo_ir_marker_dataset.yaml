@@ -1,0 +1,10 @@
+# Pseudo-labeled bootstrap dataset generated from infrared_data.
+# Labels come from the bright-circle preview detector, not human annotation.
+
+path: datasets/pseudo_ir_marker_ball
+train: images/train
+val: images/val
+test:
+
+names:
+  0: ir_marker_ball

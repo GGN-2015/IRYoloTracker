@@ -1,0 +1,20 @@
+# YOLO dataset configuration for infrared marker balls.
+#
+# Expected layout:
+# datasets/ir_marker_ball/
+#   images/train/*.png
+#   images/val/*.png
+#   labels/train/*.txt
+#   labels/val/*.txt
+#
+# Label rows must use YOLO detection format:
+# class_id x_center y_center width height
+# where all coordinates are normalized to 0..1 and class_id is always 0.
+
+path: ../datasets/ir_marker_ball
+train: images/train
+val: images/val
+test:
+
+names:
+  0: ir_marker_ball
