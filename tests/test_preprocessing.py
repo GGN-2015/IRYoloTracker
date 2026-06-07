@@ -6,8 +6,8 @@ import pytest
 from ir_yolo_tracker.preprocessing import PreprocessConfig, prepare_yolo_image, validate_ir_frame
 
 
-def test_validate_ir_frame_accepts_512_uint16_grayscale() -> None:
-    frame = np.zeros((512, 512), dtype=np.uint16)
+def test_validate_ir_frame_accepts_any_2d_uint16_grayscale() -> None:
+    frame = np.zeros((240, 320), dtype=np.uint16)
 
     validate_ir_frame(frame)
 
@@ -17,7 +17,7 @@ def test_validate_ir_frame_accepts_512_uint16_grayscale() -> None:
     [
         (np.zeros((512, 512, 1), dtype=np.uint16), ValueError),
         (np.zeros((512, 512, 3), dtype=np.uint16), ValueError),
-        (np.zeros((256, 512), dtype=np.uint16), ValueError),
+        (np.zeros((0, 512), dtype=np.uint16), ValueError),
         (np.zeros((512, 512), dtype=np.uint8), TypeError),
     ],
 )
@@ -29,17 +29,26 @@ def test_validate_ir_frame_rejects_non_matching_input(
         validate_ir_frame(frame)
 
 
+def test_validate_ir_frame_can_enforce_explicit_shape() -> None:
+    frame = np.zeros((240, 320), dtype=np.uint16)
+
+    validate_ir_frame(frame, frame_shape=(240, 320))
+
+    with pytest.raises(ValueError):
+        validate_ir_frame(frame, frame_shape=(512, 512))
+
+
 def test_prepare_yolo_image_repeats_gray_for_standard_yolo() -> None:
-    frame = np.zeros((512, 512), dtype=np.uint16)
-    frame[200:220, 250:270] = 50_000
+    frame = np.zeros((240, 320), dtype=np.uint16)
+    frame[100:120, 150:170] = 50_000
 
     image = prepare_yolo_image(frame)
 
-    assert image.shape == (512, 512, 3)
+    assert image.shape == (240, 320, 3)
     assert image.dtype == np.uint8
     assert np.array_equal(image[:, :, 0], image[:, :, 1])
     assert np.array_equal(image[:, :, 1], image[:, :, 2])
-    assert image[210, 260, 0] == 255
+    assert image[110, 160, 0] == 255
 
 
 def test_prepare_yolo_image_preserves_very_small_bright_marker() -> None:
@@ -53,11 +62,11 @@ def test_prepare_yolo_image_preserves_very_small_bright_marker() -> None:
 
 
 def test_prepare_yolo_image_supports_true_one_channel_model_input() -> None:
-    frame = np.zeros((512, 512), dtype=np.uint16)
+    frame = np.zeros((240, 320), dtype=np.uint16)
 
     image = prepare_yolo_image(frame, model_input_channels=1)
 
-    assert image.shape == (512, 512, 1)
+    assert image.shape == (240, 320, 1)
     assert image.dtype == np.uint8
 
 

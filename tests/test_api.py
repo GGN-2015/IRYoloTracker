@@ -29,7 +29,7 @@ class FakeModel:
 
 def test_detect_markers_uses_injected_tracker() -> None:
     tracker = IRMarkerTracker(model=FakeModel())
-    frame = np.zeros((512, 512), dtype=np.uint16)
+    frame = np.zeros((240, 320), dtype=np.uint16)
 
     detections = detect_markers(frame, tracker=tracker)
 
@@ -56,7 +56,7 @@ def test_detect_marker_dicts_returns_json_ready_dicts() -> None:
 
 def test_iter_marker_detections_reuses_tracker() -> None:
     tracker = IRMarkerTracker(model=FakeModel())
-    frames = [np.zeros((512, 512), dtype=np.uint16) for _ in range(2)]
+    frames = [np.zeros((240, 320), dtype=np.uint16) for _ in range(2)]
 
     results = list(iter_marker_detections(frames, tracker=tracker))
 
@@ -75,7 +75,7 @@ def test_detect_marker_batch_returns_list() -> None:
 def test_iter_pickle_detections(tmp_path) -> None:
     import pickle
 
-    frame = np.zeros((512, 512), dtype=np.uint16)
+    frame = np.zeros((240, 320), dtype=np.uint16)
     path = tmp_path / "0000001.pickle"
     with path.open("wb") as file:
         pickle.dump(frame, file)

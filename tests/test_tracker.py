@@ -58,7 +58,7 @@ def test_tracker_accepts_injected_model_without_weights() -> None:
 def test_detect_filters_to_marker_class_and_sorts_by_confidence() -> None:
     model = FakeModel()
     tracker = IRMarkerTracker(model=model, confidence_threshold=0.1, device="cpu")
-    frame = np.zeros((512, 512), dtype=np.uint16)
+    frame = np.zeros((240, 320), dtype=np.uint16)
 
     detections = tracker.detect(frame)
 
@@ -89,7 +89,7 @@ def test_detect_passes_single_marker_class_filter_to_yolo() -> None:
         iou_threshold=0.3,
         device="cpu",
     )
-    frame = np.zeros((512, 512), dtype=np.uint16)
+    frame = np.zeros((240, 320), dtype=np.uint16)
 
     tracker.detect(frame)
 
@@ -98,17 +98,17 @@ def test_detect_passes_single_marker_class_filter_to_yolo() -> None:
     assert call["conf"] == 0.4
     assert call["iou"] == 0.3
     assert call["verbose"] is False
-    assert call["source"].shape == (512, 512, 3)
+    assert call["source"].shape == (240, 320, 3)
 
 
 def test_detect_supports_one_channel_model_input() -> None:
     model = FakeModel()
     tracker = IRMarkerTracker(model=model, model_input_channels=1, device="cpu")
-    frame = np.zeros((512, 512), dtype=np.uint16)
+    frame = np.zeros((240, 320), dtype=np.uint16)
 
     tracker.detect(frame)
 
-    assert model.calls[-1]["source"].shape == (512, 512, 1)
+    assert model.calls[-1]["source"].shape == (240, 320, 1)
 
 
 def test_detect_dicts_returns_json_ready_output() -> None:

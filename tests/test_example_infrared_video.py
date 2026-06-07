@@ -36,14 +36,14 @@ def test_extract_frame_array_accepts_common_dict_keys() -> None:
 
 
 def test_load_pickle_frame_reads_uint16_array(tmp_path: Path) -> None:
-    frame = np.zeros((512, 512), dtype=np.uint16)
+    frame = np.zeros((240, 320), dtype=np.uint16)
     path = tmp_path / "0000001.pickle"
     with path.open("wb") as file:
         pickle.dump(frame, file)
 
     loaded = load_pickle_frame(path)
 
-    assert loaded.shape == (512, 512)
+    assert loaded.shape == (240, 320)
     assert loaded.dtype == np.uint16
 
 
@@ -57,7 +57,7 @@ def test_list_pickle_frames_sorts_by_name(tmp_path: Path) -> None:
 
 
 def test_preload_pickle_frames_loads_frames_in_order(tmp_path: Path) -> None:
-    frame = np.zeros((512, 512), dtype=np.uint16)
+    frame = np.zeros((240, 320), dtype=np.uint16)
     for name in ("0000002.pickle", "0000001.pickle"):
         with (tmp_path / name).open("wb") as file:
             pickle.dump(frame, file)
@@ -65,7 +65,7 @@ def test_preload_pickle_frames_loads_frames_in_order(tmp_path: Path) -> None:
     loaded = preload_pickle_frames(tmp_path)
 
     assert [path.name for path, _ in loaded] == ["0000001.pickle", "0000002.pickle"]
-    assert all(item.shape == (512, 512) for _, item in loaded)
+    assert all(item.shape == (240, 320) for _, item in loaded)
 
 
 def test_preload_pickle_frames_supports_progress_flag(tmp_path: Path) -> None:
